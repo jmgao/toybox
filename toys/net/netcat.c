@@ -5,7 +5,7 @@
  * TODO: udp, ipv6, genericize for telnet/microcom/tail-f
 
 USE_NETCAT(OLDTOY(nc, netcat, TOYFLAG_USR|TOYFLAG_BIN))
-USE_NETCAT(NEWTOY(netcat, USE_NETCAT_LISTEN("^tlL")"w#W#p#s:q#f:"USE_NETCAT_LISTEN("[!tlL][!Lw]"), TOYFLAG_BIN))
+USE_NETCAT(NEWTOY(netcat, USE_NETCAT_LISTEN("^tlL")"w#W#p:s:q#f:"USE_NETCAT_LISTEN("[!tlL][!Lw]"), TOYFLAG_BIN))
 
 config NETCAT
   bool "netcat"
@@ -50,7 +50,7 @@ GLOBALS(
   char *filename;        // -f read from filename instead of network
   long quit_delay;       // -q Exit after EOF from stdin after # seconds.
   char *source_address;  // -s Bind to a specific source address.
-  long port;             // -p Bind to a specific source port.
+  char *port;            // -p Bind to a specific source port.
   long idle;             // -W Wait # seconds for more data
   long wait;             // -w Wait # seconds for a connection.
 )
@@ -68,26 +68,59 @@ static void set_alarm(int seconds)
   alarm(seconds);
 }
 
-// Translate x.x.x.x numeric IPv4 address, or else DNS lookup an IPv4 name.
-static void lookup_name(char *name, uint32_t *result)
-{
-  struct hostent *hostbyname;
-
-  hostbyname = gethostbyname(name); // getaddrinfo
-  if (!hostbyname) error_exit("no host '%s'", name);
-  *result = *(uint32_t *)*hostbyname->h_addr_list;
+static int socket_bind(struct addrinfo *ai, void *fd_) {
+  int fd = *(int*)fd_;
+  return bind(fd, ai->ai_addr, ai->ai_addrlen);
 }
 
-// Worry about a fancy lookup later.
-static void lookup_port(char *str, uint16_t *port)
-{
-  *port = SWAP_BE16(atoi(str));
+static int socket_connect(struct addrinfo *ai, void *unused) {
+  int fd, rc;
+
+  fd = socket(ai->ai_family, ai->ai_socktype, ai->ai_protocol);
+  if (fd == -1) return -1;
+
+  fcntl(fd, F_SETFD, FD_CLOEXEC);
+  setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &rc, sizeof(rc));
+
+  if (TT.source_address || TT.port) {
+    rc = xgetaddrinfo(TT.source_address, TT.port, ai->ai_family,
+      ai->ai_socktype, ai->ai_protocol, ai->ai_flags, socket_bind, &fd);
+    if (rc != 0) {
+      close(fd);
+      return -1;
+    }
+  }
+
+  rc = connect(fd, ai->ai_addr, ai->ai_addrlen);
+  if (rc == -1) {
+    close(fd);
+    return -1;
+  }
+  return fd;
+}
+
+static int socket_server(struct addrinfo *ai, void *unused) {
+  int fd, rc;
+
+  fd = socket(ai->ai_family, ai->ai_socktype, ai->ai_protocol);
+  if (fd == -1) return -1;
+
+  fcntl(fd, F_SETFD, FD_CLOEXEC);
+  setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &rc, sizeof(rc));
+
+  if (bind(fd, ai->ai_addr, ai->ai_addrlen)) {
+    close(fd);
+    return -1;
+  }
+
+  return fd;
 }
 
 void netcat_main(void)
 {
   struct sockaddr_in *address = (void *)toybuf;
-  int sockfd=-1, in1 = 0, in2 = 0, out1 = 1, out2 = 1;
+  int sockfd = -1, in1 = 0, in2 = 0, out1 = 1, out2 = 1;
+  int family = 0; // TODO: -4, -6
   pid_t child;
 
   // Addjust idle and quit_delay to miliseconds or -1 for no timeout
@@ -103,93 +136,81 @@ void netcat_main(void)
         help_exit("bad argument count");
 
   if (TT.filename) in1 = out2 = xopen(TT.filename, O_RDWR);
-  else {
-    // Setup socket
-    sockfd = xsocket(AF_INET, SOCK_STREAM, 0);
-    fcntl(sockfd, F_SETFD, FD_CLOEXEC);
-    setsockopt(sockfd, SOL_SOCKET, SO_REUSEADDR, &out1, sizeof(out1));
-    address->sin_family = AF_INET;
+  else if (!CFG_NETCAT_LISTEN || !(toys.optflags&(FLAG_L|FLAG_l))) {
+    // Dial out
+    sockfd = xgetaddrinfo(toys.optargs[0], toys.optargs[1], family,
+      SOCK_STREAM, 0, 0, socket_connect, 0);
+    if (sockfd < 0) perror_exit("connect");
+
+    in1 = out2 = sockfd;
+  } else {
+    socklen_t len = sizeof(*address);
+
     if (TT.source_address || TT.port) {
-      address->sin_port = SWAP_BE16(TT.port);
-      if (TT.source_address)
-        lookup_name(TT.source_address, (uint32_t *)&(address->sin_addr));
-      if (bind(sockfd, (struct sockaddr *)address, sizeof(*address)))
-        perror_exit("bind");
+      sockfd = xgetaddrinfo(TT.source_address, TT.port, family, SOCK_STREAM, 0, 0,
+        socket_server, &sockfd);
+    } else {
+      sockfd = xsocket(family ? family : AF_INET, SOCK_STREAM, 0);
     }
 
-    // Dial out
+    if (sockfd == -1) perror_exit("bind");
 
-    if (!CFG_NETCAT_LISTEN || !(toys.optflags&(FLAG_L|FLAG_l))) {
-      // Figure out where to dial out to.
-      lookup_name(*toys.optargs, (uint32_t *)&(address->sin_addr));
-      lookup_port(toys.optargs[1], &(address->sin_port));
-// TODO xconnect
-      if (connect(sockfd, (struct sockaddr *)address, sizeof(*address))<0)
-        perror_exit("connect");
-      in1 = out2 = sockfd;
+    if (listen(sockfd, 5)) error_exit("listen");
+    if (!TT.port) {
+      getsockname(sockfd, (struct sockaddr *)address, &len);
+      printf("%d\n", SWAP_BE16(address->sin_port));
+      fflush(stdout);
+      // Return immediately if no -p and -Ll has arguments, so wrapper
+      // script can use port number.
+      if (CFG_TOYBOX_FORK && toys.optc && xfork()) goto cleanup;
+    }
 
-    // Listen for incoming connections
+    for (;;) {
+      child = 0;
+      len = sizeof(*address); // gcc's insane optimizer can overwrite this
+      in1 = out2 = accept(sockfd, (struct sockaddr *)address, &len);
 
-    } else {
-      socklen_t len = sizeof(*address);
+      if (in1<0) perror_exit("accept");
 
-      if (listen(sockfd, 5)) error_exit("listen");
-      if (!TT.port) {
-        getsockname(sockfd, (struct sockaddr *)address, &len);
-        printf("%d\n", SWAP_BE16(address->sin_port));
-        fflush(stdout);
-        // Return immediately if no -p and -Ll has arguments, so wrapper
-        // script can use port number.
-        if (CFG_TOYBOX_FORK && toys.optc && xfork()) goto cleanup;
-      }
+      // We can't exit this loop or the optimizer's "liveness analysis"
+      // combines badly with vfork() to corrupt or local variables
+      // (the child's call stack gets trimmed and the next function call
+      // stops the variables the parent tries to re-use next loop)
+      // So there's a bit of redundancy here
 
-      for (;;) {
-        child = 0;
-        len = sizeof(*address); // gcc's insane optimizer can overwrite this
-        in1 = out2 = accept(sockfd, (struct sockaddr *)address, &len);
+      // We have a connection. Disarm timeout.
+      set_alarm(0);
 
-        if (in1<0) perror_exit("accept");
-
-        // We can't exit this loop or the optimizer's "liveness analysis"
-        // combines badly with vfork() to corrupt or local variables
-        // (the child's call stack gets trimmed and the next function call
-        // stops the variables the parent tries to re-use next loop)
-        // So there's a bit of redundancy here
-
-        // We have a connection. Disarm timeout.
-        set_alarm(0);
-
-        if (toys.optc) {
-          // Do we need a tty?
+      if (toys.optc) {
+        // Do we need a tty?
 
 // TODO nommu, and -t only affects server mode...? Only do -t with optc
-//        if (CFG_TOYBOX_FORK && (toys.optflags&FLAG_t))
-//          child = forkpty(&fdout, NULL, NULL, NULL);
-//        else
+//      if (CFG_TOYBOX_FORK && (toys.optflags&FLAG_t))
+//        child = forkpty(&fdout, NULL, NULL, NULL);
+//      else
 
-          // Do we need to fork and/or redirect for exec?
+        // Do we need to fork and/or redirect for exec?
 
-          if (toys.optflags&FLAG_L) {
-            toys.stacktop = 0;
-            child = vfork();
-          }
-          if (child<0) error_msg("vfork failed\n");
-          else {
-            if (child) {
-              close(in1);
-              continue;
-            }
-            dup2(in1, 0);
-            dup2(in1, 1);
-            if (toys.optflags&FLAG_L) dup2(in1, 2);
-            if (in1>2) close(in1);
-            xexec(toys.optargs);
-          }
+        if (toys.optflags&FLAG_L) {
+          toys.stacktop = 0;
+          child = vfork();
         }
-
-        pollinate(in1, in2, out1, out2, TT.idle, TT.quit_delay);
-        close(in1);
+        if (child<0) error_msg("vfork failed\n");
+        else {
+          if (child) {
+            close(in1);
+            continue;
+          }
+          dup2(in1, 0);
+          dup2(in1, 1);
+          if (toys.optflags&FLAG_L) dup2(in1, 2);
+          if (in1>2) close(in1);
+          xexec(toys.optargs);
+        }
       }
+
+      pollinate(in1, in2, out1, out2, TT.idle, TT.quit_delay);
+      close(in1);
     }
   }
 

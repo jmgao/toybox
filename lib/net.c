@@ -15,34 +15,53 @@ void xsetsockopt(int fd, int level, int opt, void *val, socklen_t len)
   if (-1 == setsockopt(fd, level, opt, val, len)) perror_exit("setsockopt");
 }
 
-int xconnect(char *host, char *port, int family, int socktype, int protocol,
-             int flags)
+int xgetaddrinfo(char *host, char *port, int family, int socktype, int protocol,
+                 int flags, int (*cb)(struct addrinfo*, void*), void *cookie)
 {
-  struct addrinfo info, *ai, *ai2;
-  int fd;
+  int rc;
+  struct addrinfo info, *ai, *ai_head;
 
-  memset(&info, 0, sizeof(struct addrinfo));
+  memset(&info, 0, sizeof(info));
   info.ai_family = family;
   info.ai_socktype = socktype;
   info.ai_protocol = protocol;
   info.ai_flags = flags;
 
-  fd = getaddrinfo(host, port, &info, &ai);
-  if (fd || !ai)
-    error_exit("Connect '%s%s%s': %s", host, port ? ":" : "", port ? port : "",
-      fd ? gai_strerror(fd) : "not found");
-
-  // Try all the returned addresses. Report errors if last entry can't connect.
-  for (ai2 = ai; ai; ai = ai->ai_next) {
-    fd = (ai->ai_next ? socket : xsocket)(ai->ai_family, ai->ai_socktype,
-      ai->ai_protocol);
-    if (!connect(fd, ai->ai_addr, ai->ai_addrlen)) break;
-    else if (!ai->ai_next) perror_exit("connect");
-    close(fd);
+  rc = getaddrinfo(host, port, &info, &ai);
+  if (rc || !ai) {
+    error_exit("getaddrinfo '%s%s%s': %s", host, port ? ":" : "", port ? port : "",
+      rc ? gai_strerror(rc) : "not found");
   }
-  freeaddrinfo(ai2);
+
+  for (ai_head = ai; ai; ai = ai->ai_next) {
+    rc = cb(ai, cookie);
+    if (rc != -1) break;
+  }
+  freeaddrinfo(ai_head);
+
+  return rc;
+}
+
+static int _xconnect(struct addrinfo* ai, void *unused) {
+  int fd;
+
+  fd = socket(ai->ai_family, ai->ai_socktype, ai->ai_protocol);
+  if (fd == -1) {
+    return -1;
+  } else if (!connect(fd, ai->ai_addr, ai->ai_addrlen)) {
+    close(fd);
+    return -1;
+  }
 
   return fd;
+}
+
+int xconnect(char *host, char *port, int family, int socktype, int protocol,
+             int flags)
+{
+  int rc = xgetaddrinfo(host, port, family, socktype, protocol, flags, _xconnect, 0);
+  if (rc == -1) perror_exit("connect");
+  return rc;
 }
 
 int xpoll(struct pollfd *fds, int nfds, int timeout)
