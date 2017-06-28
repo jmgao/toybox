@@ -5,7 +5,7 @@
  * TODO: udp, ipv6, genericize for telnet/microcom/tail-f
 
 USE_NETCAT(OLDTOY(nc, netcat, TOYFLAG_USR|TOYFLAG_BIN))
-USE_NETCAT(NEWTOY(netcat, USE_NETCAT_LISTEN("^tlL")"w#W#p:s:q#f:"USE_NETCAT_LISTEN("[!tlL][!Lw]"), TOYFLAG_BIN))
+USE_NETCAT(NEWTOY(netcat, USE_NETCAT_LISTEN("^tlL")"w#W#p:s:q#f:46"USE_NETCAT_LISTEN("[!tlL][!Lw]")"[!46]", TOYFLAG_BIN))
 
 config NETCAT
   bool "netcat"
@@ -13,6 +13,7 @@ config NETCAT
   help
     usage: netcat [-u] [-wpq #] [-s addr] {IPADDR PORTNUM|-f FILENAME}
 
+    -4, -6	force IPv4, IPv6
     -f	use FILENAME (ala /dev/ttyS0) instead of network
     -p	local port number
     -q	quit SECONDS after EOF on stdin, even if stdout hasn't closed yet
@@ -120,8 +121,11 @@ void netcat_main(void)
 {
   struct sockaddr_in *address = (void *)toybuf;
   int sockfd = -1, in1 = 0, in2 = 0, out1 = 1, out2 = 1;
-  int family = 0; // TODO: -4, -6
+  int family = 0;
   pid_t child;
+
+  if (toys.optflags&FLAG_4) family = AF_INET;
+  if (toys.optflags&FLAG_6) family = AF_INET6;
 
   // Addjust idle and quit_delay to miliseconds or -1 for no timeout
   TT.idle = TT.idle ? TT.idle*1000 : -1;
