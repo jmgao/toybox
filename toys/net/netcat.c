@@ -5,7 +5,7 @@
  * TODO: udp, ipv6, genericize for telnet/microcom/tail-f
 
 USE_NETCAT(OLDTOY(nc, netcat, TOYFLAG_USR|TOYFLAG_BIN))
-USE_NETCAT(NEWTOY(netcat, USE_NETCAT_LISTEN("^tlL")"w#W#p:s:q#f:46"USE_NETCAT_LISTEN("[!tlL][!Lw]")"[!46]", TOYFLAG_BIN))
+USE_NETCAT(NEWTOY(netcat, USE_NETCAT_LISTEN("^tlL")"w#W#p:s:uq#f:46"USE_NETCAT_LISTEN("[!tlL][!Lw]")"[!46][!fu]", TOYFLAG_BIN))
 
 config NETCAT
   bool "netcat"
@@ -18,6 +18,7 @@ config NETCAT
     -p	local port number
     -q	quit SECONDS after EOF on stdin, even if stdout hasn't closed yet
     -s	local source address
+    -u	use UDP instead of TCP
     -w	SECONDS timeout to establish connection
     -W	SECONDS timeout for idle connection
 
@@ -81,7 +82,10 @@ static int socket_connect(struct addrinfo *ai, void *unused) {
   if (fd == -1) return -1;
 
   fcntl(fd, F_SETFD, FD_CLOEXEC);
-  setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &rc, sizeof(rc));
+
+  if (!(toys.optflags&FLAG_u)) {
+    setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &rc, sizeof(rc));
+  }
 
   if (TT.source_address || TT.port) {
     rc = xgetaddrinfo(TT.source_address, TT.port, ai->ai_family,
@@ -121,11 +125,13 @@ void netcat_main(void)
 {
   struct sockaddr_in *address = (void *)toybuf;
   int sockfd = -1, in1 = 0, in2 = 0, out1 = 1, out2 = 1;
+  int socktype = SOCK_STREAM;
   int family = 0;
   pid_t child;
 
-  if (toys.optflags&FLAG_4) family = AF_INET;
-  if (toys.optflags&FLAG_6) family = AF_INET6;
+  if ((toys.optflags&FLAG_u)) socktype = SOCK_DGRAM;
+  if ((toys.optflags&FLAG_4)) family = AF_INET;
+  if ((toys.optflags&FLAG_6)) family = AF_INET6;
 
   // Addjust idle and quit_delay to miliseconds or -1 for no timeout
   TT.idle = TT.idle ? TT.idle*1000 : -1;
@@ -143,7 +149,7 @@ void netcat_main(void)
   else if (!CFG_NETCAT_LISTEN || !(toys.optflags&(FLAG_L|FLAG_l))) {
     // Dial out
     sockfd = xgetaddrinfo(toys.optargs[0], toys.optargs[1], family,
-      SOCK_STREAM, 0, 0, socket_connect, 0);
+      socktype, 0, 0, socket_connect, 0);
     if (sockfd < 0) perror_exit("connect");
 
     in1 = out2 = sockfd;
@@ -151,15 +157,29 @@ void netcat_main(void)
     socklen_t len = sizeof(*address);
 
     if (TT.source_address || TT.port) {
-      sockfd = xgetaddrinfo(TT.source_address, TT.port, family, SOCK_STREAM, 0, 0,
+      sockfd = xgetaddrinfo(TT.source_address, TT.port, family, socktype, 0, 0,
         socket_server, &sockfd);
     } else {
-      sockfd = xsocket(family ? family : AF_INET, SOCK_STREAM, 0);
+      sockfd = xsocket(family ? family : AF_INET, socktype, 0);
     }
 
     if (sockfd == -1) perror_exit("bind");
 
-    if (listen(sockfd, 5)) error_exit("listen");
+    if ((toys.optflags&FLAG_u)) {
+      struct sockaddr_storage ss;
+      socklen_t socklen = sizeof(ss);
+
+      if (recvfrom(sockfd, 0, 0, MSG_PEEK, (struct sockaddr*)&ss, &socklen) == -1) {
+        perror_exit("recvfrom");
+      }
+
+      if (connect(sockfd, (struct sockaddr*)&ss, socklen) == -1) {
+        perror_exit("connect");
+      }
+    } else {
+      if (listen(sockfd, 5)) perror_exit("listen");
+    }
+
     if (!TT.port) {
       getsockname(sockfd, (struct sockaddr *)address, &len);
       printf("%d\n", SWAP_BE16(address->sin_port));
@@ -172,7 +192,11 @@ void netcat_main(void)
     for (;;) {
       child = 0;
       len = sizeof(*address); // gcc's insane optimizer can overwrite this
-      in1 = out2 = accept(sockfd, (struct sockaddr *)address, &len);
+      if ((toys.optflags&FLAG_u)) {
+        in1 = out2 = sockfd;
+      } else {
+        in1 = out2 = accept(sockfd, (struct sockaddr *)address, &len);
+      }
 
       if (in1<0) perror_exit("accept");
 
