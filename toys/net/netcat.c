@@ -189,7 +189,7 @@ void netcat_main(void)
       if (CFG_TOYBOX_FORK && toys.optc && xfork()) goto cleanup;
     }
 
-    for (;;) {
+    do {
       child = 0;
       len = sizeof(*address); // gcc's insane optimizer can overwrite this
       if ((toys.optflags&FLAG_u)) {
@@ -239,7 +239,9 @@ void netcat_main(void)
 
       pollinate(in1, in2, out1, out2, TT.idle, TT.quit_delay);
       close(in1);
-    }
+    } while (!(toys.optflags&FLAG_l));
+
+    goto cleanup;
   }
 
   // We have a connection. Disarm timeout.
